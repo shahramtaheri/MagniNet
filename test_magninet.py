@@ -1,0 +1,520 @@
+# test_magninet.py
+# Test-time evaluation for MagniNet:
+# - Multi-class (8-class): accuracy + macro precision/recall/F1 + confusion matrix
+# - Binary (benign/malignant): accuracy + precision/recall/specificity/F1 + AUROC + confusion matrix
+#
+# Expected checkpoint formats:
+# 1) Our trainer-style checkpoint: {"model": state_dict, ...}
+# 2) Plain state_dict saved via torch.save(model.state_dict(), ...)
+#
+# Dataset folder layout:
+#   data_root/test/
+#     images/
+#     labels.json              # filename -> int (0..7)
+#     binary_labels.json       # optional filename -> 0/1 (if absent, derived from y_mc)
+#
+# pip install timm scikit-learn matplotlib
+
+import os
+import json
+import argparse
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional, List
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+from PIL import Image
+
+import numpy as np
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    precision_recall_fscore_support,
+    roc_auc_score,
+)
+
+try:
+    import timm
+except ImportError as e:
+    raise ImportError("Please install timm: pip install timm") from e
+
+
+# -------------------------
+# Dataset
+# -------------------------
+class ImageFolderWithLabels(Dataset):
+    def __init__(self, root: str, image_size: int = 224):
+        self.root = root
+        self.image_dir = os.path.join(root, "images")
+        labels_path = os.path.join(root, "labels.json")
+        if not os.path.exists(labels_path):
+            raise FileNotFoundError(f"Missing labels.json at: {labels_path}")
+
+        with open(labels_path, "r") as f:
+            self.labels = json.load(f)
+
+        bin_path = os.path.join(root, "binary_labels.json")
+        self.has_binary = os.path.exists(bin_path)
+        if self.has_binary:
+            with open(bin_path, "r") as f:
+                self.bin_labels = json.load(f)
+        else:
+            self.bin_labels = {}
+
+        self.files = sorted(list(self.labels.keys()))
+        if len(self.files) == 0:
+            raise RuntimeError(f"No samples found in labels.json under: {root}")
+
+        self.image_size = image_size
+
+    @staticmethod
+    def _resize(img: Image.Image, size: int) -> Image.Image:
+        return img.resize((size, size), resample=Image.BILINEAR)
+
+    @staticmethod
+    def _to_tensor(img: Image.Image) -> torch.Tensor:
+        # CHW float in [0,1]
+        arr = np.array(img, dtype=np.float32) / 255.0
+        x = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+        return x
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx: int):
+        fname = self.files[idx]
+        path = os.path.join(self.image_dir, fname)
+        img = Image.open(path).convert("RGB")
+        img = self._resize(img, self.image_size)
+        x = self._to_tensor(img)
+
+        y_mc = int(self.labels[fname])
+
+        if self.has_binary:
+            y_bin = int(self.bin_labels[fname])
+        else:
+            # Default mapping (change if your class indexing differs):
+            # 0..3 benign, 4..7 malignant
+            y_bin = 0 if y_mc in [0, 1, 2, 3] else 1
+
+        return x, torch.tensor(y_mc, dtype=torch.long), torch.tensor(y_bin, dtype=torch.float32), fname
+
+
+# -------------------------
+# MagniNet (model)
+# -------------------------
+class AdaptiveGate(nn.Module):
+    def __init__(self, dim: int, hidden: int = 128):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        g = self.mlp(x)  # [B,N,1]
+        return x * g
+
+
+class CrossAttentionFusion(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 8, attn_drop: float = 0.0, proj_drop: float = 0.15):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.q = nn.Linear(dim, dim, bias=True)
+        self.k = nn.Linear(dim, dim, bias=True)
+        self.v = nn.Linear(dim, dim, bias=True)
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.gate = AdaptiveGate(dim)
+
+    def forward(self, global_tokens, local_tokens):
+        B, Ng, D = global_tokens.shape
+        _, Nl, _ = local_tokens.shape
+
+        q = self.q(global_tokens).reshape(B, Ng, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k(local_tokens).reshape(B, Nl, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v(local_tokens).reshape(B, Nl, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        out = attn @ v
+        out = out.transpose(1, 2).reshape(B, Ng, D)
+
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        out = self.gate(out)
+        return out
+
+
+class FFN(nn.Module):
+    def __init__(self, dim: int, mlp_ratio: float = 4.0, drop: float = 0.15):
+        super().__init__()
+        hidden = int(dim * mlp_ratio)
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(hidden, dim),
+            nn.Dropout(drop),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class AdaptiveAttentionTransformerBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 8, attn_drop: float = 0.0, drop: float = 0.15, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, dropout=attn_drop, batch_first=True)
+        self.drop1 = nn.Dropout(drop)
+
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = FFN(dim, mlp_ratio=mlp_ratio, drop=drop)
+        self.gate = AdaptiveGate(dim)
+
+    def forward(self, x):
+        x1 = self.norm1(x)
+        attn_out, _ = self.attn(x1, x1, x1, need_weights=False)
+        x = x + self.drop1(attn_out)
+        x = x + self.ffn(self.norm2(x))
+        x = self.gate(x)
+        return x
+
+
+class EfficientNetLocalEncoder(nn.Module):
+    def __init__(self, model_name: str = "efficientnet_b0", out_dim: int = 256, pretrained: bool = False):
+        super().__init__()
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=(2, 4, 6),
+        )
+        feat_channels = self.backbone.feature_info.channels()
+        self.proj = nn.ModuleList([nn.Conv2d(c, out_dim, kernel_size=1, bias=False) for c in feat_channels])
+        self.bn = nn.ModuleList([nn.BatchNorm2d(out_dim) for _ in feat_channels])
+        self.fuse = nn.Conv2d(out_dim * len(feat_channels), out_dim, kernel_size=1, bias=False)
+
+    def forward(self, x):
+        feats = self.backbone(x)
+        proj_feats = []
+        for f, p, bn in zip(feats, self.proj, self.bn):
+            proj_feats.append(bn(p(f)))
+
+        Hmax = max(t.shape[-2] for t in proj_feats)
+        Wmax = max(t.shape[-1] for t in proj_feats)
+        aligned = []
+        for t in proj_feats:
+            if t.shape[-2:] != (Hmax, Wmax):
+                t = F.interpolate(t, size=(Hmax, Wmax), mode="bilinear", align_corners=False)
+            aligned.append(t)
+
+        fused = self.fuse(torch.cat(aligned, dim=1))
+        tokens = fused.flatten(2).transpose(1, 2)  # [B, H*W, D]
+        return tokens
+
+
+class MagniNet(nn.Module):
+    def __init__(
+        self,
+        num_classes: int = 8,
+        dim: int = 256,
+        num_heads: int = 8,
+        pretrained_backbones: bool = False,
+        swin_name: str = "swin_tiny_patch4_window7_224",
+        drop: float = 0.15,
+    ):
+        super().__init__()
+        self.local_encoder = EfficientNetLocalEncoder("efficientnet_b0", out_dim=dim, pretrained=pretrained_backbones)
+
+        self.swin = timm.create_model(
+            swin_name,
+            pretrained=pretrained_backbones,
+            features_only=True,
+            out_indices=(3,),
+        )
+        swin_channels = self.swin.feature_info.channels()[0]
+        self.swin_proj = nn.Sequential(
+            nn.Conv2d(swin_channels, dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dim),
+        )
+
+        self.cross_attn = CrossAttentionFusion(dim=dim, num_heads=num_heads, attn_drop=0.0, proj_drop=drop)
+        self.blocks = nn.Sequential(
+            AdaptiveAttentionTransformerBlock(dim=dim, num_heads=num_heads, attn_drop=0.0, drop=drop),
+            AdaptiveAttentionTransformerBlock(dim=dim, num_heads=num_heads, attn_drop=0.0, drop=drop),
+        )
+        self.norm = nn.LayerNorm(dim)
+
+        self.head_multiclass = nn.Linear(dim, num_classes)
+        self.head_binary = nn.Linear(dim, 1)
+
+    def forward(self, x):
+        local_tokens = self.local_encoder(x)
+        swin_feat = self.swin(x)[0]
+        swin_feat = self.swin_proj(swin_feat)
+        global_tokens = swin_feat.flatten(2).transpose(1, 2)
+
+        fused = self.cross_attn(global_tokens, local_tokens)
+        fused = self.blocks(fused)
+        fused = self.norm(fused)
+
+        emb = fused.mean(dim=1)
+        logits_mc = self.head_multiclass(emb)
+        logits_bin = self.head_binary(emb).squeeze(-1)
+        return logits_mc, logits_bin
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def load_checkpoint(model: nn.Module, ckpt_path: str, device: str):
+    obj = torch.load(ckpt_path, map_location=device)
+    if isinstance(obj, dict) and "model" in obj:
+        state = obj["model"]
+    elif isinstance(obj, dict) and any(k.startswith("head_") or k.startswith("local_encoder") for k in obj.keys()):
+        state = obj
+    else:
+        # fallback: if user saved plain state_dict but wrapped differently
+        state = obj
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"[WARN] Missing keys: {len(missing)}")
+    if unexpected:
+        print(f"[WARN] Unexpected keys: {len(unexpected)}")
+
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def save_confusion_matrix_png(cm: np.ndarray, class_names: List[str], out_path: str, title: str):
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure()
+    plt.imshow(cm, interpolation="nearest")
+    plt.title(title)
+    plt.colorbar()
+    tick_marks = np.arange(len(class_names))
+    plt.xticks(tick_marks, class_names, rotation=45, ha="right")
+    plt.yticks(tick_marks, class_names)
+
+    # annotate
+    thresh = cm.max() / 2.0 if cm.max() > 0 else 0.5
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, f"{cm[i, j]}",
+                     ha="center", va="center",
+                     color="white" if cm[i, j] > thresh else "black")
+
+    plt.ylabel("True")
+    plt.xlabel("Predicted")
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+# -------------------------
+# Main evaluation
+# -------------------------
+@torch.no_grad()
+def run_test(args):
+    device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
+    ensure_dir(args.out_dir)
+
+    # dataset
+    test_root = os.path.join(args.data_root, "test") if os.path.isdir(os.path.join(args.data_root, "test")) else args.data_root
+    ds = ImageFolderWithLabels(test_root, image_size=args.image_size)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+
+    # model
+    model = MagniNet(
+        num_classes=args.num_classes,
+        dim=args.dim,
+        num_heads=args.heads,
+        pretrained_backbones=False,  # do not load pretrained when evaluating a trained checkpoint
+        swin_name=args.swin_name,
+        drop=args.drop,
+    ).to(device)
+    model.eval()
+    load_checkpoint(model, args.checkpoint, device)
+
+    # collect predictions
+    y_mc_true, y_mc_pred = [], []
+    y_bin_true, y_bin_pred = [], []
+    y_bin_prob = []  # for AUROC
+    filenames = []
+
+    for x, y_mc, y_bin, fn in loader:
+        x = x.to(device, non_blocking=True)
+        logits_mc, logits_bin = model(x)
+
+        probs_bin = torch.sigmoid(logits_bin).detach().cpu().numpy()
+        pred_bin = (probs_bin >= 0.5).astype(np.int64)
+
+        pred_mc = logits_mc.argmax(dim=1).detach().cpu().numpy()
+
+        y_mc_true.extend(y_mc.numpy().tolist())
+        y_mc_pred.extend(pred_mc.tolist())
+
+        y_bin_true.extend(y_bin.numpy().astype(np.int64).tolist())
+        y_bin_pred.extend(pred_bin.tolist())
+        y_bin_prob.extend(probs_bin.tolist())
+
+        filenames.extend(list(fn))
+
+    y_mc_true = np.array(y_mc_true, dtype=np.int64)
+    y_mc_pred = np.array(y_mc_pred, dtype=np.int64)
+    y_bin_true = np.array(y_bin_true, dtype=np.int64)
+    y_bin_pred = np.array(y_bin_pred, dtype=np.int64)
+    y_bin_prob = np.array(y_bin_prob, dtype=np.float32)
+
+    # -------------------------
+    # Multi-class metrics
+    # -------------------------
+    mc_acc = accuracy_score(y_mc_true, y_mc_pred)
+
+    mc_prec, mc_rec, mc_f1, _ = precision_recall_fscore_support(
+        y_mc_true, y_mc_pred, average="macro", zero_division=0
+    )
+
+    mc_cm = confusion_matrix(y_mc_true, y_mc_pred, labels=list(range(args.num_classes)))
+
+    # -------------------------
+    # Binary metrics
+    # -------------------------
+    bin_acc = accuracy_score(y_bin_true, y_bin_pred)
+    bin_prec, bin_rec, bin_f1, _ = precision_recall_fscore_support(
+        y_bin_true, y_bin_pred, average="binary", zero_division=0
+    )
+
+    # specificity = TN / (TN + FP)
+    tn, fp, fn, tp = confusion_matrix(y_bin_true, y_bin_pred, labels=[0, 1]).ravel()
+    bin_spec = (tn / (tn + fp)) if (tn + fp) > 0 else 0.0
+
+    # AUROC (requires both classes present)
+    try:
+        bin_auc = roc_auc_score(y_bin_true, y_bin_prob)
+    except ValueError:
+        bin_auc = float("nan")
+
+    bin_cm = confusion_matrix(y_bin_true, y_bin_pred, labels=[0, 1])
+
+    # -------------------------
+    # Save outputs
+    # -------------------------
+    # Class names (edit to match your indexing)
+    default_names = ["AD", "FA", "PT", "TA", "DC", "LC", "MC", "PC"]
+    class_names = args.class_names.split(",") if args.class_names else default_names
+    if len(class_names) != args.num_classes:
+        print(f"[WARN] class_names count ({len(class_names)}) != num_classes ({args.num_classes}). Using indices.")
+        class_names = [str(i) for i in range(args.num_classes)]
+
+    # Save confusion matrix images
+    save_confusion_matrix_png(
+        mc_cm, class_names,
+        os.path.join(args.out_dir, "confusion_multiclass.png"),
+        "MagniNet - Multi-class Confusion Matrix"
+    )
+    save_confusion_matrix_png(
+        bin_cm, ["Benign", "Malignant"],
+        os.path.join(args.out_dir, "confusion_binary.png"),
+        "MagniNet - Binary Confusion Matrix"
+    )
+
+    # Save metrics JSON
+    report = {
+        "multiclass": {
+            "accuracy": float(mc_acc),
+            "macro_precision": float(mc_prec),
+            "macro_recall": float(mc_rec),
+            "macro_f1": float(mc_f1),
+            "confusion_matrix": mc_cm.tolist(),
+        },
+        "binary": {
+            "accuracy": float(bin_acc),
+            "precision": float(bin_prec),
+            "recall": float(bin_rec),
+            "specificity": float(bin_spec),
+            "f1": float(bin_f1),
+            "auroc": float(bin_auc) if not (isinstance(bin_auc, float) and np.isnan(bin_auc)) else None,
+            "confusion_matrix": bin_cm.tolist(),
+            "tn_fp_fn_tp": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
+        },
+        "checkpoint": os.path.abspath(args.checkpoint),
+        "data_root": os.path.abspath(test_root),
+        "device": device,
+    }
+
+    with open(os.path.join(args.out_dir, "test_report.json"), "w") as f:
+        json.dump(report, f, indent=2)
+
+    # Print summary
+    print("\n=== Multi-class (8-class) ===")
+    print(f"Accuracy        : {mc_acc:.4f}")
+    print(f"Macro Precision : {mc_prec:.4f}")
+    print(f"Macro Recall    : {mc_rec:.4f}")
+    print(f"Macro F1        : {mc_f1:.4f}")
+
+    print("\n=== Binary (benign/malignant) ===")
+    print(f"Accuracy   : {bin_acc:.4f}")
+    print(f"Precision  : {bin_prec:.4f}")
+    print(f"Recall     : {bin_rec:.4f}")
+    print(f"Specificity: {bin_spec:.4f}")
+    print(f"F1-score   : {bin_f1:.4f}")
+    print(f"AUROC      : {bin_auc:.4f}" if report["binary"]["auroc"] is not None else "AUROC      : n/a")
+
+    print(f"\nSaved outputs to: {os.path.abspath(args.out_dir)}")
+    print(" - test_report.json")
+    print(" - confusion_multiclass.png")
+    print(" - confusion_binary.png")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Test MagniNet on a held-out test set.")
+    p.add_argument("--data_root", type=str, required=True,
+                   help="Path to magnification folder containing test/ OR directly to test/ folder.")
+    p.add_argument("--checkpoint", type=str, required=True,
+                   help="Path to model checkpoint (best.pt/last.pt or state_dict).")
+    p.add_argument("--out_dir", type=str, default="./results/test",
+                   help="Directory to save metrics and confusion matrices.")
+    p.add_argument("--cpu", action="store_true", help="Force CPU evaluation.")
+
+    # model params (must match training)
+    p.add_argument("--num_classes", type=int, default=8)
+    p.add_argument("--dim", type=int, default=256)
+    p.add_argument("--heads", type=int, default=8)
+    p.add_argument("--swin_name", type=str, default="swin_tiny_patch4_window7_224")
+    p.add_argument("--drop", type=float, default=0.15)
+
+    # data/loader
+    p.add_argument("--image_size", type=int, default=224)
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--workers", type=int, default=4)
+
+    # optional class names override
+    p.add_argument("--class_names", type=str, default="",
+                   help="Comma-separated class names in index order, e.g. AD,FA,PT,TA,DC,LC,MC,PC")
+
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    run_test(args)
