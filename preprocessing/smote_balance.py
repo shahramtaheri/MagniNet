@@ -1,8 +1,23 @@
 # smote_balance.py
-from imblearn.over_sampling import SMOTE
-import numpy as np
+# Feature-level SMOTE balancing (not applied directly on images)
 
-def apply_smote(features, labels, random_state=42):
+import numpy as np
+from imblearn.over_sampling import SMOTE
+
+
+def apply_smote(features: np.ndarray, labels: np.ndarray, random_state: int = 42):
+    """
+    Apply SMOTE to balance feature embeddings.
+
+    Args:
+        features: Feature matrix of shape (N, D)
+        labels: Class labels of shape (N,)
+        random_state: Random seed
+
+    Returns:
+        Balanced features and labels
+    """
+
     smote = SMOTE(random_state=random_state)
-    X_res, y_res = smote.fit_resample(features, labels)
-    return X_res, y_res
+    X_resampled, y_resampled = smote.fit_resample(features, labels)
+    return X_resampled, y_resampled
