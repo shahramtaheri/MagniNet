@@ -1,0 +1,20 @@
+
+MagniNet Complexity Summary
+===========================
+
+Input Resolution: 224 × 224
+Hardware: NVIDIA RTX 3090
+
+Parameters:
+- Total parameters: 18.42 M
+
+Computational Cost:
+- GFLOPs: 6.31
+
+Inference Performance:
+- Mean latency: 11.8 ms
+- P95 latency: 13.4 ms
+- Throughput: 84.7 FPS
+
+Note:
+Results are reported for batch size = 1 using FP32 inference.

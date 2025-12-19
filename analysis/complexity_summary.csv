@@ -1,0 +1,2 @@
+Model,Params (M),GFLOPs,Mean Latency (ms),P95 (ms),FPS
+MagniNet,18.42,6.31,11.8,13.4,84.7
