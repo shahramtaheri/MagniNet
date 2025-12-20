@@ -15,7 +15,7 @@ Key Contributions
 -Integrated interpretability using SHAP, Grad-CAM++, and LIME
 -External validation on multiple independent histopathology datasets
 -Lightweight architecture with low parameter count and fast inference
-=======================================================
+
 Repository Structure
 MagniNet/
 ├── train_magninet.py
