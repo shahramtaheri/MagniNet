@@ -8,6 +8,7 @@ The Visual Computer, under review. ( The DOI will be updated after publication.)
 
 
 Overview
+
 This repository provides the official PyTorch implementation of MagniNet, a magnification-specific hybrid CNN–Transformer framework for breast cancer histopathology image classification. The model is designed to jointly perform binary benign–malignant classification and eight-class histological subtype recognition, while maintaining strong interpretability and computational efficiency.
 
 MagniNet integrates EfficientNet-based local feature extraction, cross-attention fusion, and a hierarchical Swin Transformer to capture both fine-grained cellular morphology and long-range contextual dependencies. Separate models are trained for each optical magnification (40×, 100×, 200×, and 400×), enabling scale-specific representation learning consistent with pathological diagnostic workflows.
