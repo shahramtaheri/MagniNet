@@ -1,6 +1,7 @@
 MagniNet: Magnification-Specific Hybrid CNN–Transformer Framework for Breast Cancer Histopathology Classification
 Citation:
 If you use this code, please cite:
+
 Shahram Taheri.
 MagniNet: A Magnification-Specific Hybrid CNN–Transformer Framework for Accurate Breast Cancer Histopathology Classification.
 The Visual Computer, under review. ( The DOI will be updated after publication.)
