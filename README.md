@@ -1,4 +1,10 @@
 MagniNet: Magnification-Specific Hybrid CNN–Transformer Framework for Breast Cancer Histopathology Classification
+Citation:
+If you use this code, please cite:
+Shahram Taheri.
+MagniNet: A Magnification-Specific Hybrid CNN–Transformer Framework for Accurate Breast Cancer Histopathology Classification.
+The Visual Computer, under review. ( The DOI will be updated after publication.)
+
 
 Overview
 This repository provides the official PyTorch implementation of MagniNet, a magnification-specific hybrid CNN–Transformer framework for breast cancer histopathology image classification. The model is designed to jointly perform binary benign–malignant classification and eight-class histological subtype recognition, while maintaining strong interpretability and computational efficiency.
@@ -95,55 +101,24 @@ python test_magninet.py --checkpoint best.pt
 
 External Validation
 python evaluate_external.py --checkpoint best.pt --dataset BACH
-
-
 Evaluation metrics include accuracy, precision, recall, specificity, F1-score, and AUROC.
-
 Interpretability
-
-MagniNet integrates multiple interpretability techniques:
-
-Grad-CAM++ for class-discriminative localization
-
-SHAP for pixel-level attribution
-
-LIME for superpixel-based explanations
-
-Quantitative evaluation is performed using Pointing Game Accuracy and ROI Intersection-over-Union (IoU) against expert-annotated regions.
-
-Computational Analysis
-
-The repository includes scripts to compute:
-
-Model parameters
-
-FLOPs
-
-Inference time
-
-Statistical significance tests (McNemar’s test)
-
-These analyses correspond to the efficiency and statistical validation reported in the manuscript.
+ MagniNet integrates multiple interpretability techniques:
+ Grad-CAM++ for class-discriminative localization
+ SHAP for pixel-level attribution
+ LIME for superpixel-based explanations
+ Quantitative evaluation is performed using Pointing Game Accuracy and ROI Intersection-over-Union (IoU) against expert-annotated regions.
+ 
+ Computational Analysis
+  The repository includes scripts to compute:
+  Model parameters
+   FLOPs
+   Inference time
+   Statistical significance tests (McNemar’s test)
+ These analyses correspond to the efficiency and statistical validation reported in the manuscript.
 
 Reproducibility
+ All experiments are fully reproducible using the provided configuration files, scripts, and documented training protocols. Random seeds are fixed and dataset splits are explicitly defined.
 
-All experiments are fully reproducible using the provided configuration files, scripts, and documented training protocols. Random seeds are fixed and dataset splits are explicitly defined.
-
-Citation
-
-If you use this code, please cite:
-
-Shahram Taheri.
-MagniNet: A Magnification-Specific Hybrid CNN–Transformer Framework for Accurate Breast Cancer Histopathology Classification.
-The Visual Computer, under review.
-
-
-(Please update with the final DOI after publication.)
-
-License
-
-This repository is released for research and academic use. See the LICENSE file for details.
-
-Contact
 
 For questions or clarifications related to the implementation or experiments, please contact the corresponding author.
